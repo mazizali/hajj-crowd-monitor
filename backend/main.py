@@ -36,6 +36,7 @@ app.add_middleware(
 clients: Set[WebSocket] = set()
 _loop: asyncio.AbstractEventLoop | None = None
 _grabbers: dict[str, StreamGrabber] = {}
+_last_frames: dict[str, str] = {}  # streamId → base64 JPEG string
 
 
 async def _broadcast(payload: dict):
@@ -63,6 +64,7 @@ def _on_frame(stream_id: str, frame: np.ndarray):
 
     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
     frame_b64 = base64.b64encode(buf).decode()
+    _last_frames[stream_id] = frame_b64   # cache for HTTP polling
 
     payload = {
         'type': 'analysis',
@@ -112,6 +114,19 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         clients.discard(ws)
         print(f'[ws] Client disconnected ({len(clients)} total)')
+
+
+@app.get('/api/frame')
+async def api_frame(stream: str = 'haram'):
+    """HTTP polling endpoint — mirrors the Vercel serverless function for local dev."""
+    from fastapi import Query
+    from fastapi.responses import JSONResponse
+    frame_b64 = _last_frames.get(stream)
+    return JSONResponse({
+        'streamId': stream,
+        'timestamp': int(time.time() * 1000),
+        'frame': frame_b64,
+    })
 
 
 @app.get('/health')

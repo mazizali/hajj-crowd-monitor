@@ -394,6 +394,24 @@ function computeRegions(grid) {
   return result;
 }
 
+function computeZonesFromGrid(grid) {
+  if (!grid || !grid.length) return [];
+  const gs = grid.length;
+  const half = Math.floor(gs / 2);
+  const zoneDefs = [
+    { name: 'الشمالية', r0: 0,    r1: half, c0: 0,    c1: gs   },
+    { name: 'الجنوبية', r0: half, r1: gs,   c0: 0,    c1: gs   },
+    { name: 'الشرقية',  r0: 0,    r1: gs,   c0: half, c1: gs   },
+    { name: 'الغربية',  r0: 0,    r1: gs,   c0: 0,    c1: half },
+  ];
+  return zoneDefs.map(({ name, r0, r1, c0, c1 }) => {
+    let sum = 0, count = 0;
+    for (let r = r0; r < r1; r++)
+      for (let c = c0; c < c1; c++) { sum += grid[r][c].density; count++; }
+    return { name, density: parseFloat((sum / count * 100).toFixed(1)) };
+  });
+}
+
 // ─── Components ─────────────────────────────────────────────────────────────
 
 const DensityGauge = ({ percentage, label }) => {
@@ -814,9 +832,10 @@ export default function UnifiedDashboard() {
   const [alerts, setAlerts] = useState([]);
   const [paused, setPaused] = useState({ haram: false, arafat: false });
   const [frameRefresh, setFrameRefresh] = useState(0);
-  const [wsStatus, setWsStatus] = useState('disconnected'); // 'connecting' | 'connected' | 'disconnected'
+  const [apiStatus, setApiStatus] = useState('connecting'); // 'connecting' | 'connected' | 'disconnected'
   const [realFrames, setRealFrames] = useState({});
-  const wsRef = useRef(null);
+  const pausedRef = useRef({ haram: false, arafat: false });
+  const everConnectedRef = useRef(false);
 
   // Generate frames for streams (regenerate on refresh tick)
   const streamFrames = useMemo(() => ({
@@ -870,74 +889,95 @@ export default function UnifiedDashboard() {
     });
   }, [paused]);
 
-  // Simulation fallback — only runs when WebSocket is disconnected
+  // Keep pausedRef in sync with paused state (avoids stale closure in polling callback)
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
+
+  // Simulation fallback — only runs when API is disconnected / not yet connected
   useEffect(() => {
-    if (wsStatus === 'connected') return;
+    if (apiStatus === 'connected') return;
     tick();
     const interval = setInterval(tick, SAMPLING_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [tick, wsStatus]);
+  }, [tick, apiStatus]);
 
-  // WebSocket connection to real backend
+  // HTTP polling — fetches live YouTube thumbnails from the Vercel serverless API
+  // and runs client-side crowd density analysis on each frame.
   useEffect(() => {
     let cancelled = false;
+    const timers = {};
 
-    const connect = () => {
-      if (cancelled) return;
-      setWsStatus('connecting');
-      const ws = new WebSocket('ws://localhost:8000/ws');
+    const analyzeAndUpdate = (streamId, imgSrc, timestamp) => {
+      const img = new Image();
+      img.onload = () => {
+        if (cancelled || pausedRef.current[streamId]) return;
+        const result = analyzeImage(img);
+        if (!result) return;
 
-      ws.onopen = () => {
-        if (!cancelled) setWsStatus('connected');
-      };
+        const allD = result.grid.flat().map(c => c.density);
+        const avgDensity = allD.reduce((a, b) => a + b, 0) / allD.length;
+        const stream = STREAMS[streamId];
+        const pct = parseFloat((avgDensity * 100).toFixed(2));
 
-      ws.onmessage = (event) => {
-        if (cancelled) return;
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type !== 'analysis') return;
-          const { streamId, frame, grid, ...analysis } = msg;
-          if (paused[streamId]) return;
+        const analysis = {
+          timestamp,
+          percentage: pct,
+          estimatedCount: Math.round(avgDensity * stream.maxCapacity),
+          congestionLevel: pct > 80 ? 'high' : pct > 60 ? 'medium' : 'low',
+          densityZones: computeZonesFromGrid(result.grid),
+          events: pct > 85 ? ['تكدس عالي'] : [],
+          confidence: 0.90,
+        };
 
-          if (frame) {
-            setRealFrames(prev => ({ ...prev, [streamId]: `data:image/jpeg;base64,${frame}` }));
-          }
-          setStreamData(prev => ({ ...prev, [streamId]: analysis }));
-          setHistory(prev => ({
-            ...prev,
-            [streamId]: [...(prev[streamId] || []), {
-              time: formatTime(analysis.timestamp),
-              percentage: analysis.percentage,
-              count: analysis.estimatedCount,
-            }].slice(-MAX_HISTORY_POINTS),
-          }));
-          if (analysis.percentage > 85) {
-            const stream = STREAMS[streamId];
-            setAlerts(a => [{
-              id: Date.now() + streamId,
-              stream: stream?.name || streamId,
-              message: `تجاوز عتبة الازدحام (${analysis.percentage.toFixed(1)}%)`,
-              severity: 'high', time: Date.now(),
-            }, ...a].slice(0, 8));
-          }
-        } catch (_) {}
-      };
-
-      ws.onclose = () => {
-        if (!cancelled) {
-          setWsStatus('disconnected');
-          setTimeout(connect, 4000);
+        setStreamData(prev => ({ ...prev, [streamId]: analysis }));
+        setHistory(prev => ({
+          ...prev,
+          [streamId]: [...(prev[streamId] || []), {
+            time: formatTime(analysis.timestamp),
+            percentage: analysis.percentage,
+            count: analysis.estimatedCount,
+          }].slice(-MAX_HISTORY_POINTS),
+        }));
+        if (analysis.percentage > 85) {
+          setAlerts(a => [{
+            id: Date.now() + streamId,
+            stream: stream.name,
+            message: `تجاوز عتبة الازدحام (${analysis.percentage.toFixed(1)}%)`,
+            severity: 'high', time: Date.now(),
+          }, ...a].slice(0, 8));
         }
       };
-
-      ws.onerror = () => ws.close();
-      wsRef.current = ws;
+      img.src = imgSrc;
     };
 
-    connect();
+    const pollStream = async (streamId) => {
+      if (cancelled) return;
+      try {
+        const resp = await fetch(`/api/frame?stream=${streamId}&_=${Date.now()}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+
+        if (!cancelled && data.frame) {
+          everConnectedRef.current = true;
+          setApiStatus('connected');
+          const imgSrc = `data:image/jpeg;base64,${data.frame}`;
+          setRealFrames(prev => ({ ...prev, [streamId]: imgSrc }));
+          analyzeAndUpdate(streamId, imgSrc, data.timestamp);
+        }
+      } catch (_) {
+        if (!cancelled && !everConnectedRef.current) setApiStatus('disconnected');
+      }
+      if (!cancelled) {
+        timers[streamId] = setTimeout(() => pollStream(streamId), 15000);
+      }
+    };
+
+    // Stagger the two polls so they don't fire simultaneously
+    pollStream('haram');
+    timers['arafat_init'] = setTimeout(() => pollStream('arafat'), 3000);
+
     return () => {
       cancelled = true;
-      wsRef.current?.close();
+      Object.values(timers).forEach(clearTimeout);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1016,18 +1056,18 @@ export default function UnifiedDashboard() {
             </div>
 
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-md border text-[10px] font-mono transition-colors ${
-              wsStatus === 'connected'
+              apiStatus === 'connected'
                 ? 'border-emerald-800 bg-emerald-950/30 text-emerald-300'
-                : wsStatus === 'connecting'
+                : apiStatus === 'connecting'
                 ? 'border-amber-800 bg-amber-950/20 text-amber-400'
                 : 'border-stone-800 bg-stone-900/40 text-stone-500'
             }`}>
               <div className={`w-1.5 h-1.5 rounded-full ${
-                wsStatus === 'connected' ? 'bg-emerald-400 animate-pulse'
-                : wsStatus === 'connecting' ? 'bg-amber-400 animate-pulse'
+                apiStatus === 'connected' ? 'bg-emerald-400 animate-pulse'
+                : apiStatus === 'connecting' ? 'bg-amber-400 animate-pulse'
                 : 'bg-stone-600'
               }`} />
-              {wsStatus === 'connected' ? 'AI LIVE' : wsStatus === 'connecting' ? 'CONNECTING' : 'SIMULATED'}
+              {apiStatus === 'connected' ? 'AI LIVE' : apiStatus === 'connecting' ? 'CONNECTING' : 'SIMULATED'}
             </div>
             <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-md border border-stone-800 bg-stone-900/40">
               <Sparkles size={11} className="text-amber-500" />
@@ -1116,7 +1156,7 @@ export default function UnifiedDashboard() {
                   onTogglePause={() => setPaused(p => ({ ...p, [stream.id]: !p[stream.id] }))}
                   onAnalyzeFrame={handleAnalyzeFrame}
                   frameSrc={displayFrames[stream.id]}
-                  isLive={wsStatus === 'connected' && !!realFrames[stream.id]}
+                  isLive={apiStatus === 'connected' && !!realFrames[stream.id]}
                 />
               ))}
             </div>
@@ -1174,7 +1214,7 @@ export default function UnifiedDashboard() {
 
         <footer className="mt-10 pt-5 border-t border-stone-900 flex items-center justify-between flex-wrap gap-3">
           <div className="text-[10px] text-stone-600 font-mono">
-            Pipeline: <span className="text-stone-500">YouTube → yt-dlp → FFmpeg → Gemini Flash / CV → Dashboard</span>
+            Pipeline: <span className="text-stone-500">YouTube Live → Vercel Serverless → Client CV → Dashboard</span>
           </div>
           <div className="flex items-center gap-2 text-xs">
             <div className="w-1 h-1 rounded-full bg-amber-500" />
