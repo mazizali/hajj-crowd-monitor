@@ -224,6 +224,22 @@ function generateCrowdImage(scenario, seed = 1) {
 }
 
 // ─── Stream/Sample Definitions ──────────────────────────────────────────────
+
+// YouTube video IDs used for direct browser thumbnail loading
+const YT_VIDEO_IDS = { haram: 'fZvuHkHYaXk', arafat: 'hOPiS2SeO8U' };
+
+// Ordered list of thumbnail URL candidates (cache-busted)
+const ytThumbCandidates = (videoId) => {
+  const ts = Date.now();
+  return [
+    `https://i.ytimg.com/vi/${videoId}/maxresdefault_live.jpg?_=${ts}`,
+    `https://i.ytimg.com/vi/${videoId}/hqdefault_live.jpg?_=${ts}`,
+    `https://i.ytimg.com/vi/${videoId}/sddefault_live.jpg?_=${ts}`,
+    `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg?_=${ts}`,
+    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg?_=${ts}`,
+  ];
+};
+
 const STREAMS = {
   haram: {
     id: 'haram', name: 'الحرم المكي', nameEn: 'Masjid al-Haram',
@@ -834,6 +850,7 @@ export default function UnifiedDashboard() {
   const [frameRefresh, setFrameRefresh] = useState(0);
   const [apiStatus, setApiStatus] = useState('connecting'); // 'connecting' | 'connected' | 'disconnected'
   const [realFrames, setRealFrames] = useState({});
+  const [liveThumbs, setLiveThumbs] = useState({}); // direct YouTube thumbnails loaded in-browser
   const pausedRef = useRef({ haram: false, arafat: false });
   const everConnectedRef = useRef(false);
 
@@ -981,11 +998,49 @@ export default function UnifiedDashboard() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Use real frames when available, fall back to simulated
+  // ── Direct browser thumbnail loading ──────────────────────────────────────
+  // Loads YouTube live thumbnails directly in the browser (avoids cloud IP
+  // blocks that affect serverless functions). No CORS needed — just display.
+  useEffect(() => {
+    let cancelled = false;
+    const timers = {};
+
+    const loadThumb = (streamId) => {
+      if (cancelled) return;
+      const candidates = ytThumbCandidates(YT_VIDEO_IDS[streamId]);
+      let idx = 0;
+
+      const tryNext = () => {
+        if (idx >= candidates.length || cancelled) return;
+        const img = new Image();
+        img.onload = () => {
+          // Reject tiny placeholder images (YouTube returns ~120×90 when unavailable)
+          if (!cancelled && img.naturalWidth > 150) {
+            setLiveThumbs(prev => ({ ...prev, [streamId]: candidates[idx] }));
+          } else {
+            idx++; tryNext();
+          }
+        };
+        img.onerror = () => { idx++; tryNext(); };
+        img.src = candidates[idx];
+      };
+
+      tryNext();
+      // Refresh every 15 s to track live changes
+      timers[`refresh_${streamId}`] = setTimeout(() => loadThumb(streamId), 15000);
+    };
+
+    loadThumb('haram');
+    timers['arafat_delay'] = setTimeout(() => loadThumb('arafat'), 2000);
+
+    return () => { cancelled = true; Object.values(timers).forEach(clearTimeout); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Priority: serverless base64 frame → direct YouTube thumb → canvas simulation
   const displayFrames = useMemo(() => ({
-    haram: realFrames.haram || streamFrames.haram,
-    arafat: realFrames.arafat || streamFrames.arafat,
-  }), [realFrames, streamFrames]);
+    haram:  realFrames.haram  || liveThumbs.haram  || streamFrames.haram,
+    arafat: realFrames.arafat || liveThumbs.arafat || streamFrames.arafat,
+  }), [realFrames, liveThumbs, streamFrames]);
 
   const handleAnalyzeFrame = (streamId) => {
     const stream = STREAMS[streamId];
@@ -1055,20 +1110,25 @@ export default function UnifiedDashboard() {
               </button>
             </div>
 
-            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-md border text-[10px] font-mono transition-colors ${
-              apiStatus === 'connected'
-                ? 'border-emerald-800 bg-emerald-950/30 text-emerald-300'
-                : apiStatus === 'connecting'
-                ? 'border-amber-800 bg-amber-950/20 text-amber-400'
-                : 'border-stone-800 bg-stone-900/40 text-stone-500'
-            }`}>
-              <div className={`w-1.5 h-1.5 rounded-full ${
-                apiStatus === 'connected' ? 'bg-emerald-400 animate-pulse'
-                : apiStatus === 'connecting' ? 'bg-amber-400 animate-pulse'
-                : 'bg-stone-600'
-              }`} />
-              {apiStatus === 'connected' ? 'AI LIVE' : apiStatus === 'connecting' ? 'CONNECTING' : 'SIMULATED'}
-            </div>
+            {(() => {
+              const anyLive = Object.keys(liveThumbs).length > 0;
+              const isAI   = apiStatus === 'connected';
+              const label  = isAI ? 'AI LIVE' : anyLive ? 'LIVE' : apiStatus === 'connecting' ? 'CONNECTING' : 'SIMULATED';
+              const ring   = isAI ? 'border-emerald-800 bg-emerald-950/30 text-emerald-300'
+                           : anyLive ? 'border-sky-800 bg-sky-950/30 text-sky-300'
+                           : apiStatus === 'connecting' ? 'border-amber-800 bg-amber-950/20 text-amber-400'
+                           : 'border-stone-800 bg-stone-900/40 text-stone-500';
+              const dot    = isAI ? 'bg-emerald-400 animate-pulse'
+                           : anyLive ? 'bg-sky-400 animate-pulse'
+                           : apiStatus === 'connecting' ? 'bg-amber-400 animate-pulse'
+                           : 'bg-stone-600';
+              return (
+                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-md border text-[10px] font-mono transition-colors ${ring}`}>
+                  <div className={`w-1.5 h-1.5 rounded-full ${dot}`} />
+                  {label}
+                </div>
+              );
+            })()}
             <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-md border border-stone-800 bg-stone-900/40">
               <Sparkles size={11} className="text-amber-500" />
               <span className="text-[10px] text-stone-500 font-mono">made by</span>
@@ -1156,7 +1216,7 @@ export default function UnifiedDashboard() {
                   onTogglePause={() => setPaused(p => ({ ...p, [stream.id]: !p[stream.id] }))}
                   onAnalyzeFrame={handleAnalyzeFrame}
                   frameSrc={displayFrames[stream.id]}
-                  isLive={apiStatus === 'connected' && !!realFrames[stream.id]}
+                  isLive={!!realFrames[stream.id] || !!liveThumbs[stream.id]}
                 />
               ))}
             </div>
