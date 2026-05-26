@@ -2,7 +2,6 @@
   "framework": "vite",
   "functions": {
     "api/frame.py": {
-      "runtime": "python3.9",
       "maxDuration": 15
     }
   }
