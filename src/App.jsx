@@ -952,7 +952,7 @@ export default function UnifiedDashboard() {
     const pollStream = async (streamId) => {
       if (cancelled) return;
       try {
-        const resp = await fetch(`/_/backend/api/frame?stream=${streamId}&_=${Date.now()}`);
+        const resp = await fetch(`/api/frame?stream=${streamId}&_=${Date.now()}`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
 

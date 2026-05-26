@@ -5,12 +5,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      // Mirror Vercel's experimental-services routing in local dev:
-      // /_/backend/* → FastAPI backend at localhost:8000 (strips the prefix)
-      '/_/backend': {
-        target: 'http://localhost:8000',
-        rewrite: (path) => path.replace(/^\/_\/backend/, ''),
-      },
+      // In local dev, forward /api/* to the Python backend
+      '/api': 'http://localhost:8000',
     },
   },
 })
