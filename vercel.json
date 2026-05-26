@@ -1,9 +1,12 @@
 {
-  "framework": "vite",
-  "functions": {
-    "api/frame.py": {
-      "runtime": "python3.9",
-      "maxDuration": 15
+  "experimentalServices": {
+    "frontend": {
+      "routePrefix": "/",
+      "framework": "vite"
+    },
+    "backend": {
+      "root": "backend",
+      "routePrefix": "/_/backend"
     }
   }
 }
